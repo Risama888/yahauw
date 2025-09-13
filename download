@@ -1,0 +1,823 @@
+from flask import Flask, render_template_string
+import sqlite3
+import traceback
+
+app = Flask(__name__)
+
+def get_db_connection():
+    conn = sqlite3.connect('hyperliquid_positiooons.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def get_addresses_with_status():
+    try:
+        conn = get_db_connection()
+        cursor = conn.execute('SELECT address, status FROM datawhalesmartorwhalenot')
+        result = [{ 'address': row['address'], 'status': row['status'] } for row in cursor.fetchall()]
+        conn.close()
+        return result
+    except Exception as e:
+        print("Error fetching addresses and status:", e)
+        traceback.print_exc()
+        return []
+
+@app.route('/tabel_posisi')
+def tampilkan_tabel_posisi():
+    try:
+        # Ambil data address dan status
+        address_status_list = get_addresses_with_status()
+        if not address_status_list:
+            return "Gagal mengambil data address dan status dari database."
+
+        address_status_dict = {item['address']: item['status'] for item in address_status_list}
+
+        # Ambil data posisi
+        conn = get_db_connection()
+        positions = conn.execute('SELECT * FROM positions').fetchall()
+
+        # Ambil data whale smart yang pertumbuhan >= 50
+        cursor_rekom = conn.execute("SELECT * FROM datawhalesmartorwhalenot WHERE status='whale smart' AND pertumbuhan >= 50")
+        rekomendasi_whale_smart = cursor_rekom.fetchall()
+        conn.close()
+    except Exception as e:
+        return f"Error saat mengambil data: {e}"
+
+    # Filter posisi berdasarkan address dan status 'whale smart'
+    filtered_positions = []
+    for pos in positions:
+        if pos['address'] in address_status_dict:
+            posisi_dict = dict(pos)
+            posisi_dict['status'] = address_status_dict[pos['address']]
+            filtered_positions.append(posisi_dict)
+
+    whale_smart_positions = [p for p in filtered_positions if p['status'].lower() == 'whale smart']
+
+    # Hitung jumlah long dan short
+    count_long = sum(1 for p in whale_smart_positions if p['posisi'].lower() == 'long')
+    count_short = sum(1 for p in whale_smart_positions if p['posisi'].lower() == 'short')
+
+    # Hitung total size per coin
+    size_per_coin = {}
+    size_long_total = 0
+    size_short_total = 0
+    for p in whale_smart_positions:
+        coin = p['coin']
+        try:
+            size = float(p['size'])
+        except:
+            size = 0
+        posisi = p['posisi'].lower()
+        if coin not in size_per_coin:
+            size_per_coin[coin] = {'long': 0, 'short': 0}
+        if posisi == 'long':
+            size_per_coin[coin]['long'] += size
+            size_long_total += size
+        elif posisi == 'short':
+            size_per_coin[coin]['short'] += size
+            size_short_total += size
+
+    total_long_positions = sum(1 for p in whale_smart_positions if p['posisi'].lower() == 'long')
+    total_short_positions = sum(1 for p in whale_smart_positions if p['posisi'].lower() == 'short')
+
+    # Kelompok smart dan not smart untuk pengurutan
+    kelompok_smart = [p for p in filtered_positions if p['status'].lower() == 'whale smart']
+    kelompok_not_smart = [p for p in filtered_positions if p['status'].lower() == 'whale not smart']
+    urutan_terurut = []
+    if kelompok_smart:
+        urutan_terurut.extend(kelompok_smart)
+    if kelompok_not_smart:
+        urutan_terurut.append({'pemisah': True, 'judul': '------ Whale Not Smart ------'})
+        urutan_terurut.extend(kelompok_not_smart)
+
+    # Hitung jumlah long/short per coin dari whale smart
+    long_short_counts = {}
+    for p in whale_smart_positions:
+        coin = p['coin']
+        posisi = p['posisi'].lower()
+        if coin not in long_short_counts:
+            long_short_counts[coin] = {'long': 0, 'short': 0}
+        if posisi == 'long':
+            long_short_counts[coin]['long'] += 1
+        elif posisi == 'short':
+            long_short_counts[coin]['short'] += 1
+
+    sorted_counts = sorted(long_short_counts.items(), key=lambda x: max(x[1]['long'], x[1]['short']), reverse=True)
+
+    # Unrealized PnL
+    unrealized_pnl_per_coin = {}
+    total_unrealized_pnl_long = 0
+    total_unrealized_pnl_short = 0
+    for p in whale_smart_positions:
+        coin = p['coin']
+        try:
+            unrealized_pnl = float(p['unrealizedPnl'])
+        except:
+            unrealized_pnl = 0
+        posisi = p['posisi'].lower()
+        if coin not in unrealized_pnl_per_coin:
+            unrealized_pnl_per_coin[coin] = {'long': 0, 'short': 0}
+        if posisi == 'long':
+            unrealized_pnl_per_coin[coin]['long'] += unrealized_pnl
+            total_unrealized_pnl_long += unrealized_pnl
+        elif posisi == 'short':
+            unrealized_pnl_per_coin[coin]['short'] += unrealized_pnl
+            total_unrealized_pnl_short += unrealized_pnl
+
+    # Signal berdasarkan posisi negatif dan besar
+    signals_per_coin = {}
+    for coin, sizes in size_per_coin.items():
+        neg_count = 0
+        neg_size_total = 0
+        pos_count = 0
+        pos_size_total = 0
+        for p in whale_smart_positions:
+            if p['coin'] == coin:
+                try:
+                    size_value = float(p['size'])
+                except:
+                    size_value = 0
+                if size_value < 0:
+                    neg_count += 1
+                    neg_size_total += abs(size_value)
+                else:
+                    pos_count += 1
+                    pos_size_total += size_value
+        if neg_count > 0 and neg_size_total > pos_size_total:
+            signals_per_coin[coin] = {'posisi_signal': 'Sell', 'size_signal': 'Negatif Dominan'}
+        elif neg_count > 0 and neg_size_total < pos_size_total:
+            signals_per_coin[coin] = {'posisi_signal': 'Buy', 'size_signal': 'Negatif Lebih Kecil'}
+        else:
+            signals_per_coin[coin] = {'posisi_signal': 'Net', 'size_signal': 'Seimbang'}
+
+    # Sinyal berdasarkan jumlah long/short
+    posisi_jumlah_signals = {}
+    for coin in size_per_coin:
+        long_count = long_short_counts.get(coin, {}).get('long', 0)
+        short_count = long_short_counts.get(coin, {}).get('short', 0)
+        if long_count > short_count:
+            posisi_jumlah_signals[coin] = 'Buy'
+        elif short_count > long_count:
+            posisi_jumlah_signals[coin] = 'Sell'
+        else:
+            posisi_jumlah_signals[coin] = 'Net'
+
+    # --- Hitung posisi pertumbuhan >=50 ---
+    # Filter posisi dari whale smart yang dari rekomendasi (alamat cocok)
+    rekom_alamat = set(row['address'] for row in rekomendasi_whale_smart)
+    posisi_rekomendasi = [p for p in whale_smart_positions if p['address'] in rekom_alamat]
+
+    # Hitung total size long dan short dari posisi rekomendasi pertumbuhan >=50
+    total_long_size_rekomendasi = {}
+    total_short_size_rekomendasi = {}
+    for p in posisi_rekomendasi:
+        coin = p['coin']
+        try:
+            size = float(p['size'])
+        except:
+            size = 0
+        posisi = p['posisi'].lower()
+        if coin not in total_long_size_rekomendasi:
+            total_long_size_rekomendasi[coin] = 0
+        if coin not in total_short_size_rekomendasi:
+            total_short_size_rekomendasi[coin] = 0
+        if posisi == 'long':
+            total_long_size_rekomendasi[coin] += size
+        elif posisi == 'short':
+            total_short_size_rekomendasi[coin] += size
+
+    # --- Tambahan: Hitung jumlah posisi long dan short dari whale smart pertumbuhan >=50 ---
+    jumlah_long_rekomendasi = sum(1 for p in posisi_rekomendasi if p['posisi'].lower() == 'long')
+    jumlah_short_rekomendasi = sum(1 for p in posisi_rekomendasi if p['posisi'].lower() == 'short')
+
+    # Hitung jumlah posisi long dan short per coin dari posisi rekomendasi pertumbuhan >=50
+    jumlah_long_percoin_rekom = {}
+    jumlah_short_percoin_rekom = {}
+    for p in posisi_rekomendasi:
+        coin = p['coin']
+        posisi = p['posisi'].lower()
+        if coin not in jumlah_long_percoin_rekom:
+            jumlah_long_percoin_rekom[coin] = 0
+        if coin not in jumlah_short_percoin_rekom:
+            jumlah_short_percoin_rekom[coin] = 0
+        if posisi == 'long':
+            jumlah_long_percoin_rekom[coin] += 1
+        elif posisi == 'short':
+            jumlah_short_percoin_rekom[coin] += 1
+
+    # --- Render halaman ---
+    html = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Data Posisi dan Grafik</title>
+        <style>
+            body { font-family: Arial, sans-serif; }
+            .chart-container { width: 50%; margin: auto; margin-top: 20px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 40px; }
+            th, td { border: 1px solid #ddd; padding: 8px; }
+            th { background-color: #f2f2f2; }
+            .separator { text-align: center; font-weight: bold; margin: 10px 0; }
+        </style>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    </head>
+    <body>
+        <h2 style="text-align:center;">Perbandingan Posisi Long dan Short (Whale Smart)</h2>
+        <div class="chart-container">
+            <canvas id="statusChart"></canvas>
+        </div>
+        <script>
+            const ctx = document.getElementById('statusChart').getContext('2d');
+            const statusChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Long', 'Short'],
+                    datasets: [{
+                        label: 'Jumlah Posisi',
+                        data: [{{ count_long }}, {{ count_short }}],
+                        backgroundColor: [
+                            'rgba(75, 192, 192, 0.7)',
+                            'rgba(255, 99, 132, 0.7)'
+                        ],
+                        borderColor: [
+                            'rgba(75, 192, 192, 1)',
+                            'rgba(255, 99, 132, 1)'
+                        ],
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: { position: 'top' }
+                    }
+                }
+            });
+        </script>
+
+        <h2 style="text-align:center;">Data Posisi berdasarkan Status</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Address</th>
+                    <th>Status</th>
+                    <th>Coin</th>
+                    <th>Size</th>
+                    <th>Posisi</th>
+                    <th>Margin Used</th>
+                    <th>Leverage Type</th>
+                    <th>Leverage Value</th>
+                    <th>Entry Price</th>
+                    <th>Modal Awal</th>
+                    <th>Unrealized PnL</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for pos in positions %}
+                    {% if pos.get('pemisah') %}
+                        <tr>
+                            <td colspan="11" class="separator">{{ pos['judul'] }}</td>
+                        </tr>
+                    {% else %}
+                        <tr>
+                            <td>{{ pos['address'] }}</td>
+                            <td>{{ pos['status'] }}</td>
+                            <td>{{ pos['coin'] }}</td>
+                            <td>{{ pos['size'] }}</td>
+                            <td>{{ pos['posisi'] }}</td>
+                            <td>{{ pos['margin_used'] }}</td>
+                            <td>{{ pos['leverage_type'] }}</td>
+                            <td>{{ pos['leverage_value'] }}</td>
+                            <td>{{ pos['entry_price'] }}</td>
+                            <td>{{ pos['modal_awal'] }}</td>
+                            <td>{{ pos['unrealizedPnl'] }}</td>
+                        </tr>
+                    {% endif %}
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <h3 style="margin-top:50px;">Total Size Long dan Short per Coin (Whale Smart)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Coin</th>
+                    <th>Total Long Size</th>
+                    <th>Total Short Size</th>
+                    <th>Sinyal Posisi (Jumlah)</th>
+                    <th>Sinyal Size</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for coin, sizes in size_per_coin.items() %}
+                <tr>
+                    <td>{{ coin }}</td>
+                    <td>{{ sizes['long'] }}</td>
+                    <td>{{ sizes['short'] }}</td>
+                    <td>{{ posisi_jumlah_signals.get(coin, 'N/A') }}</td>
+                    <td>{{ signals_per_coin.get(coin, {}).get('posisi_signal', 'N/A') }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <h3>Jumlah Posisi Long dan Short Keseluruhan (Whale Smart)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Type</th>
+                    <th>Jumlah Posisi</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Long</td>
+                    <td>{{ total_long_positions }}</td>
+                </tr>
+                <tr>
+                    <td>Short</td>
+                    <td>{{ total_short_positions }}</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>Jumlah Posisi Long dan Short per Coin</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Coin</th>
+                    <th>Long</th>
+                    <th>Short</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for coin, counts in sorted_counts %}
+                <tr>
+                    <td>{{ coin }}</td>
+                    <td>{{ counts['long'] }}</td>
+                    <td>{{ counts['short'] }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Unrealized PnL per Coin -->
+        <h3>Unrealized PnL per Coin (Whale Smart)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Coin</th>
+                    <th>Unrealized PnL Long</th>
+                    <th>Unrealized PnL Short</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for coin, pnl in unrealized_pnl_per_coin.items() %}
+                <tr>
+                    <td>{{ coin }}</td>
+                    <td>{{ pnl['long'] }}</td>
+                    <td>{{ pnl['short'] }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <p><strong>Total Unrealized PnL Long:</strong> {{ total_unrealized_pnl_long }}</p>
+        <p><strong>Total Unrealized PnL Short:</strong> {{ total_unrealized_pnl_short }}</p>
+
+        <h3>Sinyal berdasarkan jumlah posisi Long vs Short per coin</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Coin</th>
+                    <th>Jumlah Long</th>
+                    <th>Jumlah Short</th>
+                    <th>Sinyal</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for coin, signal in posisi_jumlah_signals.items() %}
+                <tr>
+                    <td>{{ coin }}</td>
+                    <td>{{ long_short_counts.get(coin, {}).get('long', 0) }}</td>
+                    <td>{{ long_short_counts.get(coin, {}).get('short', 0) }}</td>
+                    <td>{{ signal }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Rekomendasi whale smart pertumbuhan >=50 -->
+        <h3>Rekomendasi Whale Smart (Pertumbuhan >= 50)</h3>
+        <table>
+            <thead>
+                <tr>
+                    {% if rekomendasi_whale_smart|length > 0 %}
+                        {% for col in rekomendasi_whale_smart[0].keys() %}
+                            <th>{{ col }}</th>
+                        {% endfor %}
+                    {% endif %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rekomendasi_whale_smart %}
+                <tr>
+                    {% for col in row.keys() %}
+                        <td>{{ row[col] }}</td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Total Size Long/Short dari whale smart pertumbuhan >=50 -->
+        <h3>Total Size Long dan Short dari Whale Smart (Pertumbuhan >=50)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Coin</th>
+                    <th>Total Long Size</th>
+                    <th>Total Short Size</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for coin in total_long_size_rekomendasi.keys() %}
+                <tr>
+                    <td>{{ coin }}</td>
+                    <td>{{ total_long_size_rekomendasi[coin] }}</td>
+                    <td>{{ total_short_size_rekomendasi[coin] }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Jumlah Posisi Long dan Short dari whale smart pertumbuhan >=50 -->
+        <h3>Jumlah Posisi Long dan Short dari Whale Smart (Pertumbuhan >=50)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Posisi</th>
+                    <th>Jumlah</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Long</td>
+                    <td>{{ jumlah_long_rekomendasi }}</td>
+                </tr>
+                <tr>
+                    <td>Short</td>
+                    <td>{{ jumlah_short_rekomendasi }}</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <!-- Jumlah Posisi Long dan Short per Coin dari rekomendasi pertumbuhan >=50 -->
+        <h3>Jumlah Posisi Long dan Short per Coin (Rekomendasi Pertumbuhan >=50)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Coin</th>
+                    <th>Jumlah Long</th>
+                    <th>Jumlah Short</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for coin in total_long_size_rekomendasi.keys() %}
+                <tr>
+                    <td>{{ coin }}</td>
+                    <td>{{ jumlah_long_percoin_rekom.get(coin, 0) }}</td>
+                    <td>{{ jumlah_short_percoin_rekom.get(coin, 0) }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+    </body>
+    </html>
+    '''
+
+    return render_template_string(
+        html,
+        positions=urutan_terurut,
+        count_long=count_long,
+        count_short=count_short,
+        size_per_coin=size_per_coin,
+        posisi_jumlah_signals=posisi_jumlah_signals,
+        signals_per_coin=signals_per_coin,
+        long_short_counts=long_short_counts,
+        total_long_positions=total_long_positions,
+        total_short_positions=total_short_positions,
+        sorted_counts=sorted_counts,
+        unrealized_pnl_per_coin=unrealized_pnl_per_coin,
+        total_unrealized_pnl_long=total_unrealized_pnl_long,
+        total_unrealized_pnl_short=total_unrealized_pnl_short,
+        rekomendasi_whale_smart=rekomendasi_whale_smart,
+        total_long_size_rekomendasi=total_long_size_rekomendasi,
+        total_short_size_rekomendasi=total_short_size_rekomendasi,
+        jumlah_long_rekomendasi=jumlah_long_rekomendasi,
+        jumlah_short_rekomendasi=jumlah_short_rekomendasi,
+        jumlah_long_percoin_rekom=jumlah_long_percoin_rekom,
+        jumlah_short_percoin_rekom=jumlah_short_percoin_rekom
+    )
+@app.route('/persentase')
+def tampilkan_tabel_urut():
+    conn = get_db_connection()
+    # Ambil semua data whale
+    rows = conn.execute("SELECT * FROM datawhalesmartorwhalenot").fetchall()
+
+    # Hitung total whale berdasarkan status
+    total_smart_whale = sum(1 for row in rows if row['status'] == 'whale smart')
+    total_not_smart_whale = sum(1 for row in rows if row['status'] == 'whale not smart')
+
+    # Hitung total whale smart dengan pertumbuhan > 50%
+    total_smart_whale_pertumbuhan_50 = sum(
+        1 for row in rows 
+        if row['status'] == 'whale smart' and row['pertumbuhan'] > 50
+    )
+
+    # Pisahkan data berdasarkan status
+    data_smart_whale = [row for row in rows if row['status'] == 'whale smart']
+    data_not_smart_whale = [row for row in rows if row['status'] == 'whale not smart']
+
+    # Hitung posisi Long dan Short dari tabel 'positions' per address
+    posisi_per_address = {}
+    posisi_rows = conn.execute('SELECT address, posisi FROM positions').fetchall()
+    for row in posisi_rows:
+        address = row['address']
+        posisi = row['posisi']
+        if address not in posisi_per_address:
+            posisi_per_address[address] = {'Long': 0, 'Short': 0}
+        if posisi == 'Long':
+            posisi_per_address[address]['Long'] += 1
+        elif posisi == 'Short':
+            posisi_per_address[address]['Short'] += 1
+
+    # Tentukan rekomendasi per address
+    rekomendasi_per_address = {}
+    for address, counts in posisi_per_address.items():
+        if counts['Long'] > counts['Short']:
+            rekomendasi_per_address[address] = 'Long'
+        elif counts['Short'] > counts['Long']:
+            rekomendasi_per_address[address] = 'Short'
+        else:
+            rekomendasi_per_address[address] = 'Net'
+
+    # Data whale dengan pertumbuhan > 50%
+    whale_pertumbuhan_50 = [row for row in data_smart_whale if row['pertumbuhan'] > 50]
+
+    # Rekomendasi posisi dari whale dengan pertumbuhan > 50%
+    posisi_whale_50 = {}
+    for row in whale_pertumbuhan_50:
+        address = row['address']
+        posisi_rows = conn.execute('SELECT posisi FROM positions WHERE address = ?', (address,)).fetchall()
+        posisi_list = [pos['posisi'] for pos in posisi_rows]
+        count_long = posisi_list.count('Long')
+        count_short = posisi_list.count('Short')
+        if count_long > count_short:
+            posisi_whale_50[address] = 'Long'
+        elif count_short > count_long:
+            posisi_whale_50[address] = 'Short'
+        else:
+            posisi_whale_50[address] = 'Net'
+
+    # Hitung jumlah whale Long dan Short dari data smart whale
+    whale_long_count = 0
+    whale_short_count = 0
+    for row in data_smart_whale:
+        if row['status'] == 'whale smart':
+            posisi_rows = conn.execute('SELECT posisi FROM positions WHERE address = ?', (row['address'],)).fetchall()
+            for pos in posisi_rows:
+                if pos['posisi'] == 'Long':
+                    whale_long_count += 1
+                elif pos['posisi'] == 'Short':
+                    whale_short_count += 1
+
+    # Hitung dominasi Long vs Short dari whale dengan pertumbuhan > 50%
+    long_pertumbuhan_50 = 0
+    short_pertumbuhan_50 = 0
+    for row in whale_pertumbuhan_50:
+        posisi_rows = conn.execute('SELECT posisi FROM positions WHERE address = ?', (row['address'],)).fetchall()
+        for pos in posisi_rows:
+            if pos['posisi'] == 'Long':
+                long_pertumbuhan_50 += 1
+            elif pos['posisi'] == 'Short':
+                short_pertumbuhan_50 += 1
+
+    # Render halaman dengan data dan grafik
+    html = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Data Smart Whale dan Perbandingan</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-bottom: 20px;
+            }
+            th, td {
+                border: 1px solid #dddddd;
+                padding: 8px;
+                text-align: left;
+            }
+            th {
+                background-color: #f2f2f2;
+            }
+            h3 {
+                margin-top: 40px;
+            }
+        </style>
+    </head>
+    <body>
+        <h2>Total Whale</h2>
+        <p>Smart Whale: {{ total_smart_whale }}</p>
+        <p>Not Smart Whale: {{ total_not_smart_whale }}</p>
+        <p>Smart Whale dengan Pertumbuhan > 50%: {{ total_smart_whale_pertumbuhan_50 }}</p>
+
+        <h2>Perbandingan Whale Long dan Short (Data Smart Whale)</h2>
+        <canvas id="whaleChart" width="400" height="200"></canvas>
+        <script>
+            const ctx = document.getElementById('whaleChart').getContext('2d');
+            const whaleChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: ['Long', 'Short'],
+                    datasets: [{
+                        label: 'Jumlah Whale',
+                        data: [{{ whale_long }}, {{ whale_short }}],
+                        backgroundColor: [
+                            'rgba(75, 192, 192, 0.6)',
+                            'rgba(255, 99, 132, 0.6)'
+                        ],
+                        borderColor: [
+                            'rgba(75, 192, 192, 1)',
+                            'rgba(255, 99, 132, 1)'
+                        ],
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: { display: false },
+                        title: { display: false }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: { precision:0 }
+                        }
+                    }
+                }
+            });
+        </script>
+
+        <!-- Grafik dominansi Long vs Short dari whale smart pertumbuhan > 50% -->
+        <h2>Dominasi Long vs Short dari Whale Smart dengan Pertumbuhan > 50%</h2>
+        <canvas id="dominasiChart" width="400" height="200"></canvas>
+        <script>
+            const ctx2 = document.getElementById('dominasiChart').getContext('2d');
+            const dominasiChart = new Chart(ctx2, {
+                type: 'bar',
+                data: {
+                    labels: ['Long', 'Short'],
+                    datasets: [{
+                        label: 'Jumlah',
+                        data: [{{ long_pertumbuhan_50 }}, {{ short_pertumbuhan_50 }}],
+                        backgroundColor: [
+                            'rgba(54, 162, 235, 0.6)',
+                            'rgba(255, 206, 86, 0.6)'
+                        ],
+                        borderColor: [
+                            'rgba(54, 162, 235, 1)',
+                            'rgba(255, 206, 86, 1)'
+                        ],
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: { display: false },
+                        title: { display: false }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: { precision:0 }
+                        }
+                    }
+                }
+            });
+        </script>
+
+        <!-- Data smart whale -->
+        <h2>Data Smart Whale</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Address</th>
+                    <th>Total Closed PNL</th>
+                    <th>Status</th>
+                    <th>Modal Awal</th>
+                    <th>Pertumbuhan</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in data_smart_whale %}
+                <tr>
+                    <td>{{ row.id }}</td>
+                    <td>{{ row.address }}</td>
+                    <td>{{ row.total_closed_pnl }}</td>
+                    <td>{{ row.status }}</td>
+                    <td>{{ row.modal_awal }}</td>
+                    <td>{{ row.pertumbuhan }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Data Not Smart Whale -->
+        <h2>Data Not Smart Whale</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Address</th>
+                    <th>Total Closed PNL</th>
+                    <th>Status</th>
+                    <th>Modal Awal</th>
+                    <th>Pertumbuhan</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in data_not_smart_whale %}
+                <tr>
+                    <td>{{ row.id }}</td>
+                    <td>{{ row.address }}</td>
+                    <td>{{ row.total_closed_pnl }}</td>
+                    <td>{{ row.status }}</td>
+                    <td>{{ row.modal_awal }}</td>
+                    <td>{{ row.pertumbuhan }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Rekomendasi Entry per Address -->
+        <h3>Rekomendasi Entry per Address</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Address</th>
+                    <th>Rekomendasi</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for address, rekom in rekomendasi_per_address.items() %}
+                <tr>
+                    <td>{{ address }}</td>
+                    <td>{{ rekom }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Rekomendasi posisi dari whale dengan pertumbuhan > 50% -->
+        <h3>Rekomendasi Posisi dari Whale dengan Pertumbuhan > 50%</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Address</th>
+                    <th>Rekomendasi Posisi</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for address, rekom in posisi_whale_50.items() %}
+                <tr>
+                    <td>{{ address }}</td>
+                    <td>{{ rekom }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </body>
+    </html>
+    '''
+    return render_template_string(
+        html,
+        total_smart_whale=total_smart_whale,
+        total_not_smart_whale=total_not_smart_whale,
+        total_smart_whale_pertumbuhan_50=total_smart_whale_pertumbuhan_50,
+        data_smart_whale=data_smart_whale,
+        data_not_smart_whale=data_not_smart_whale,
+        rekomendasi_per_address=rekomendasi_per_address,
+        posisi_whale_50=posisi_whale_50,
+        whale_long=whale_long_count,
+        whale_short=whale_short_count,
+        long_pertumbuhan_50=long_pertumbuhan_50,
+        short_pertumbuhan_50=short_pertumbuhan_50
+    )
+if __name__ == '__main__':
+    app.run(debug=True)
