@@ -4,7 +4,7 @@
   "rewrites": [
     {
       "source": "/(.*)",
-      "destination": "api/index.ts"
+      "destination": "index.ts"
     }
   ],
   "redirects": [{ "source": "/", "destination": "/api", "permanent": false }]
